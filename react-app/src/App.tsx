@@ -14,6 +14,12 @@ interface LineMesh {
   closed: boolean      // whether this line is a closed loop
 }
 
+interface SimplifiedLine {
+  points: Point[]
+  closed: boolean
+  polygons: Point[][]
+}
+
 interface MapData {
   wallPoints: Point[]
   startPoint: Point | null
@@ -21,10 +27,17 @@ interface MapData {
   lines: Point[][]
   lineCount: number
   closedLineCount: number  // number of closed loops
-  simplifiedLines: Point[][]
+  simplifiedLines: SimplifiedLine[]
   originalPointCount: number
   simplifiedPointCount: number
   meshes: LineMesh[]   // mesh data for each line
+  items: ItemPoint[]
+}
+
+interface ItemPoint {
+  x: number
+  y: number
+  color: string
 }
 
 // Deep copy a point
@@ -84,9 +97,113 @@ const perpendicularDistance = (point: Point, lineStart: Point, lineEnd: Point): 
   return numerator / denominator
 }
 
+// Generate collision polygons from points and thickness
+const generatePolygons = (points: Point[], thickness: number, closed: boolean): Point[][] => {
+  if (points.length < 2) return []
+
+  const halfThickness = thickness / 2
+  const leftSide: Point[] = []
+  const rightSide: Point[] = []
+  const n = points.length
+
+  for (let i = 0; i < n; i++) {
+    const curr = points[i]
+    let perpX: number, perpY: number
+
+    const hasPrev = closed || i > 0
+    const hasNext = closed || i < n - 1
+    const prevIdx = closed ? (i - 1 + n) % n : i - 1
+    const nextIdx = closed ? (i + 1) % n : i + 1
+
+    if (hasPrev && hasNext) {
+      const prev = points[prevIdx]
+      const next = points[nextIdx]
+      const dx1 = curr.x - prev.x
+      const dy1 = curr.y - prev.y
+      const len1 = Math.sqrt(dx1 * dx1 + dy1 * dy1) || 1
+      const dx2 = next.x - curr.x
+      const dy2 = next.y - curr.y
+      const len2 = Math.sqrt(dx2 * dx2 + dy2 * dy2) || 1
+      const n1x = -dy1 / len1
+      const n1y = dx1 / len1
+      const n2x = -dy2 / len2
+      const n2y = dx2 / len2
+      perpX = (n1x + n2x) / 2
+      perpY = (n1y + n2y) / 2
+      const perpLen = Math.sqrt(perpX * perpX + perpY * perpY) || 1
+      perpX /= perpLen
+      perpY /= perpLen
+      const dot = n1x * perpX + n1y * perpY
+      if (Math.abs(dot) > 0.1) {
+        perpX /= dot
+        perpY /= dot
+      }
+    } else if (hasNext) {
+      const next = points[nextIdx]
+      const dx = next.x - curr.x
+      const dy = next.y - curr.y
+      const len = Math.sqrt(dx * dx + dy * dy)
+      if (len > 0) {
+        perpX = -dy / len
+        perpY = dx / len
+      } else {
+        perpX = 0; perpY = 0
+      }
+    } else {
+      const prev = points[prevIdx]
+      const dx = curr.x - prev.x
+      const dy = curr.y - prev.y
+      const len = Math.sqrt(dx * dx + dy * dy)
+      if (len > 0) {
+        perpX = -dy / len
+        perpY = dx / len
+      } else {
+        perpX = 0; perpY = 0
+      }
+    }
+
+    if (!isNaN(perpX) && !isNaN(perpY)) {
+      leftSide.push({ x: curr.x + perpX * halfThickness, y: curr.y + perpY * halfThickness })
+      rightSide.push({ x: curr.x - perpX * halfThickness, y: curr.y - perpY * halfThickness })
+    } else {
+      leftSide.push({ ...curr })
+      rightSide.push({ ...curr })
+    }
+  }
+
+  if (closed) {
+    // Strategy: Split the ring into two solid parts to support hollow centers in physics engines.
+    // Part A: The main "C-shaped" ribbon from point 0 to n-1
+    const mainBody = [...leftSide, ...([...rightSide].reverse())]
+    
+    // Part B: The "Bridge" filler that closes the gap between the last point and the first point
+    // Use deep copy to avoid double-normalization bug (where points are subtracted twice)
+    const n = leftSide.length
+    const filler = [
+      { ...leftSide[n - 1] },
+      { ...leftSide[0] },
+      { ...rightSide[0] },
+      { ...rightSide[n - 1] }
+    ]
+    
+    return [mainBody, filler]
+  } else {
+    // For open lines, combine sides into one single wrapping polygon
+    return [[...leftSide, ...([...rightSide].reverse())]]
+  }
+}
+
 // Simplify all lines using RDP algorithm
-const simplifyLines = (lines: Point[][], epsilon: number): Point[][] => {
-  return lines.map(line => rdpSimplify(line, epsilon))
+const simplifyLines = (lines: Point[][], epsilon: number): SimplifiedLine[] => {
+  return lines.map(line => {
+    const simplifiedPoints = rdpSimplify(line, epsilon)
+    const closed = isLineClosed(line)
+    return {
+      points: simplifiedPoints,
+      closed,
+      polygons: generatePolygons(simplifiedPoints, 2, closed) // 2px thickness to match mesh
+    }
+  })
 }
 
 // Check if a line is closed (first and last points are adjacent)
@@ -174,24 +291,32 @@ const expandLineToMesh = (points: Point[], thickness: number, closed: boolean): 
       const next = points[nextIdx]
       const dx = next.x - curr.x
       const dy = next.y - curr.y
-      const len = Math.sqrt(dx * dx + dy * dy) || 1
-      perpX = -dy / len
-      perpY = dx / len
+      const len = Math.sqrt(dx * dx + dy * dy)
+      if (len > 0) {
+        perpX = -dy / len
+        perpY = dx / len
+      } else {
+        perpX = 0; perpY = 0
+      }
     } else {
       // Last point of open curve
       const prev = points[prevIdx]
       const dx = curr.x - prev.x
       const dy = curr.y - prev.y
-      const len = Math.sqrt(dx * dx + dy * dy) || 1
-      perpX = -dy / len
-      perpY = dx / len
+      const len = Math.sqrt(dx * dx + dy * dy)
+      if (len > 0) {
+        perpX = -dy / len
+        perpY = dx / len
+      } else {
+        perpX = 0; perpY = 0
+      }
     }
 
     // Add two vertices (left and right of the line)
-    const leftX = curr.x + perpX * halfThickness
-    const leftY = curr.y + perpY * halfThickness
-    const rightX = curr.x - perpX * halfThickness
-    const rightY = curr.y - perpY * halfThickness
+    const leftX = isNaN(perpX) ? curr.x : curr.x + perpX * halfThickness
+    const leftY = isNaN(perpY) ? curr.y : curr.y + perpY * halfThickness
+    const rightX = isNaN(perpX) ? curr.x : curr.x - perpX * halfThickness
+    const rightY = isNaN(perpY) ? curr.y : curr.y - perpY * halfThickness
 
     vertices.push(leftX, leftY, rightX, rightY)
 
@@ -485,17 +610,23 @@ const traceLines = (wallSet: Set<string>, width: number, height: number): Point[
       }
     }
 
-    // Find endpoint (point with only 1 neighbor, or any point if it's a loop)
+    // Find endpoint: prioritize points with minimum neighbors
     let lineStart = component[0]
+    let minNeighbors = 9
     for (const p of component) {
-      const key = `${p.x},${p.y}`
-      if (adjacency.get(key)!.length === 1) {
+      const count = adjacency.get(`${p.x},${p.y}`)!.length
+      if (count < minNeighbors) {
+        minNeighbors = count
         lineStart = p
-        break
+        if (count === 1) break // True endpoint found
       }
     }
 
-    // Calculate angle difference (normalized to -PI to PI)
+    // Trace from start point
+    const ordered: Point[] = [lineStart]
+    const visitedOrder = new Set<string>([`${lineStart.x},${lineStart.y}`])
+    let lastDir: number | null = null
+
     const angleDiff = (a1: number, a2: number): number => {
       let diff = a2 - a1
       while (diff > Math.PI) diff -= 2 * Math.PI
@@ -503,17 +634,9 @@ const traceLines = (wallSet: Set<string>, width: number, height: number): Point[
       return Math.abs(diff)
     }
 
-    // Trace from start point with direction awareness
-    const ordered: Point[] = [lineStart]
-    const visitedOrder = new Set<string>([`${lineStart.x},${lineStart.y}`])
-    let lastDir: number | null = null // Last movement direction in radians
-
     while (ordered.length < component.length) {
       const current = ordered[ordered.length - 1]
-      const key = `${current.x},${current.y}`
-      const neighbors = adjacency.get(key) || []
-
-      // Filter unvisited neighbors
+      const neighbors = adjacency.get(`${current.x},${current.y}`) || []
       const unvisited = neighbors.filter(n => !visitedOrder.has(`${n.x},${n.y}`))
 
       if (unvisited.length === 0) break
@@ -521,23 +644,21 @@ const traceLines = (wallSet: Set<string>, width: number, height: number): Point[
       let bestNeighbor: Point | null = null
 
       if (lastDir === null || unvisited.length === 1) {
-        // No direction yet or only one choice - just pick first unvisited
         bestNeighbor = unvisited[0]
       } else {
         // Choose neighbor that continues in most similar direction
-        let minAngleDiff = Infinity
+        let minDiff = Infinity
         for (const n of unvisited) {
           const newDir = Math.atan2(n.y - current.y, n.x - current.x)
           const diff = angleDiff(lastDir, newDir)
-          if (diff < minAngleDiff) {
-            minAngleDiff = diff
+          if (diff < minDiff) {
+            minDiff = diff
             bestNeighbor = n
           }
         }
       }
 
       if (bestNeighbor) {
-        // Update direction
         lastDir = Math.atan2(bestNeighbor.y - current.y, bestNeighbor.x - current.x)
         ordered.push(bestNeighbor)
         visitedOrder.add(`${bestNeighbor.x},${bestNeighbor.y}`)
@@ -578,6 +699,7 @@ function App() {
   const [star3Time, setStar3Time] = useState<number | ''>('')
 
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const collisionCanvasRef = useRef<HTMLCanvasElement>(null)
   const hiddenCanvasRef = useRef<HTMLCanvasElement>(null)
   const webglCanvasRef = useRef<HTMLCanvasElement>(null)
   const glRef = useRef<WebGLRenderingContext | null>(null)
@@ -616,37 +738,57 @@ function App() {
       const imageData = ctx.getImageData(0, 0, img.width, img.height)
       const data = imageData.data
 
+      // For 2048x1024 images, the map is the left half (1024x1024)
+      // and items are on the right half (1024x1024)
+      const mapWidth = img.width > 1024 ? Math.floor(img.width / 2) : img.width;
+
       const wallPoints: Point[] = []
       let startPoint: Point | null = null
       let endPoint: Point | null = null
       const wallSet = new Set<string>()
+      const items: ItemPoint[] = []
 
-      // Analyze each pixel
+      // Analyze each pixel for map (left side) and items (right side)
       for (let y = 0; y < img.height; y++) {
         for (let x = 0; x < img.width; x++) {
           const idx = (y * img.width + x) * 4
           const r = data[idx]
           const g = data[idx + 1]
           const b = data[idx + 2]
+          const a = data[idx + 3]
 
-          // Black wall: #000
-          if (r === 0 && g === 0 && b === 0) {
-            wallPoints.push({ x, y })
-            wallSet.add(`${x},${y}`)
-          }
-          // Green start: #0f0
-          else if (r === 0 && g === 255 && b === 0) {
-            startPoint = { x, y }
-          }
-          // Red end: #f00
-          else if (r === 255 && g === 0 && b === 0) {
-            endPoint = { x, y }
+          if (x < mapWidth) {
+            // Map analysis (Left side)
+            // Black wall: #000
+            if (r === 0 && g === 0 && b === 0) {
+              wallPoints.push({ x, y })
+              wallSet.add(`${x},${y}`)
+            }
+            // Green start: #0f0
+            else if (r === 0 && g === 255 && b === 0) {
+              startPoint = { x, y }
+            }
+            // Red end: #f00
+            else if (r === 255 && g === 0 && b === 0) {
+              endPoint = { x, y }
+            }
+          } else {
+            // Items analysis (Right side)
+            // Not pure white or transparent
+            if (a > 0 && !(r === 255 && g === 255 && b === 255)) {
+              // Convert to map coordinate system
+              items.push({
+                x: x - mapWidth,
+                y: y,
+                color: `rgb(${r}, ${g}, ${b})`
+              })
+            }
           }
         }
       }
 
       // Trace continuous lines from wall points
-      const lines = traceLines(wallSet, img.width, img.height)
+      const lines = traceLines(wallSet, mapWidth, img.height)
 
       // Apply RDP simplification (epsilon = 1.0 for pixel-level precision)
       const epsilon = 1.0
@@ -654,10 +796,10 @@ function App() {
 
       // Calculate point counts
       const originalPointCount = lines.reduce((sum, line) => sum + line.length, 0)
-      const simplifiedPointCount = simplifiedLines.reduce((sum, line) => sum + line.length, 0)
+      const simplifiedPointCount = simplifiedLines.reduce((sum, line) => sum + line.points.length, 0)
 
       // Generate mesh data for each line (2px thickness)
-      const meshes = generateMeshes(simplifiedLines, 1)
+      const meshes = generateMeshes(simplifiedLines.map(sl => sl.points), 1)
 
       // Normalize all points to top-left corner (remove extra whitespace)
       const allPoints: Point[] = [...wallPoints]
@@ -681,16 +823,27 @@ function App() {
           endPoint.x -= minX
           endPoint.y -= minY
         }
+        // Offset items
+        for (const item of items) {
+          item.x -= minX
+          item.y -= minY
+        }
         for (const line of lines) {
           for (const p of line) {
             p.x -= minX
             p.y -= minY
           }
         }
-        for (const line of simplifiedLines) {
-          for (const p of line) {
+        for (const sl of simplifiedLines) {
+          for (const p of sl.points) {
             p.x -= minX
             p.y -= minY
+          }
+          for (const poly of sl.polygons) {
+            for (const p of poly) {
+              p.x -= minX
+              p.y -= minY
+            }
           }
         }
         // Also offset mesh vertices
@@ -715,7 +868,8 @@ function App() {
         simplifiedLines,
         originalPointCount,
         simplifiedPointCount,
-        meshes
+        meshes,
+        items
       }
 
       setMapData(result)
@@ -739,12 +893,16 @@ function App() {
     // Draw lines using simplified data (black, 1px)
     ctx.strokeStyle = '#000000'
     ctx.lineWidth = 1
-    for (const line of mapData.simplifiedLines) {
-      if (line.length > 0) {
+    for (const sl of mapData.simplifiedLines) {
+      const points = sl.points
+      if (points.length > 0) {
         ctx.beginPath()
-        ctx.moveTo(line[0].x, line[0].y)
-        for (let i = 1; i < line.length; i++) {
-          ctx.lineTo(line[i].x, line[i].y)
+        ctx.moveTo(points[0].x, points[0].y)
+        for (let i = 1; i < points.length; i++) {
+          ctx.lineTo(points[i].x, points[i].y)
+        }
+        if (sl.closed) {
+          ctx.closePath()
         }
         ctx.stroke()
       }
@@ -765,7 +923,56 @@ function App() {
       ctx.arc(mapData.endPoint.x, mapData.endPoint.y, 3, 0, Math.PI * 2)
       ctx.fill()
     }
+
+    // Draw items (colored circles, 2px)
+    if (mapData.items && mapData.items.length > 0) {
+      for (const item of mapData.items) {
+        ctx.fillStyle = item.color
+        ctx.beginPath()
+        ctx.arc(item.x, item.y, 2, 0, Math.PI * 2)
+        ctx.fill()
+      }
+    }
   }, [mapData])
+
+  // Draw collision polygons on a separate canvas
+  useEffect(() => {
+    if (!mapData || !collisionCanvasRef.current) return
+
+    const canvas = collisionCanvasRef.current
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    // Clear canvas with white background
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+
+    ctx.save()
+    // Apply zoom and pan
+    ctx.translate(canvas.width / 2, canvas.height / 2)
+    ctx.scale(scale, scale)
+    ctx.translate(-translation.x, -translation.y)
+
+    // Draw polygons using alternating red and green colors (1px)
+    let polyIdx = 0
+    ctx.lineWidth = 1 / scale // Keep line width constant regardless of zoom
+    for (const sl of mapData.simplifiedLines) {
+      for (const poly of sl.polygons) {
+        ctx.strokeStyle = polyIdx % 2 === 0 ? '#ff0000' : '#00ff00'
+        if (poly.length > 0) {
+          ctx.beginPath()
+          ctx.moveTo(poly[0].x, poly[0].y)
+          for (let i = 1; i < poly.length; i++) {
+            ctx.lineTo(poly[i].x, poly[i].y)
+          }
+          ctx.closePath()
+          ctx.stroke()
+        }
+        polyIdx++
+      }
+    }
+    ctx.restore()
+  }, [mapData, scale, translation])
 
   // WebGL rendering when mapData changes
   useEffect(() => {
@@ -877,6 +1084,22 @@ function App() {
       drawCircle(gl, positionBuffer, indexBuffer, positionLocation, mapData.endPoint.x, mapData.endPoint.y, 5 / scale)
     }
 
+    // Draw items
+    if (mapData.items && mapData.items.length > 0) {
+      gl.uniform1i(useTextureLocation, 0)
+      for (const item of mapData.items) {
+        // Parse rgb string "rgb(r, g, b)"
+        const match = item.color.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/)
+        if (match) {
+          const r = parseInt(match[1]) / 255
+          const g = parseInt(match[2]) / 255
+          const b = parseInt(match[3]) / 255
+          gl.uniform4f(colorLocation, r, g, b, 1)
+          drawCircle(gl, positionBuffer, indexBuffer, positionLocation, item.x, item.y, 3 / scale)
+        }
+      }
+    }
+
     // Cleanup buffers
     gl.deleteBuffer(positionBuffer)
     gl.deleteBuffer(texCoordBuffer)
@@ -921,11 +1144,19 @@ function App() {
   // Add wheel event listener with { passive: false } to prevent page scroll
   useEffect(() => {
     const canvas = webglCanvasRef.current
+    const collisionCanvas = collisionCanvasRef.current
     if (!canvas) return
 
     canvas.addEventListener('wheel', handleWheel, { passive: false })
+    if (collisionCanvas) {
+      collisionCanvas.addEventListener('wheel', handleWheel, { passive: false })
+    }
+    
     return () => {
       canvas.removeEventListener('wheel', handleWheel)
+      if (collisionCanvas) {
+        collisionCanvas.removeEventListener('wheel', handleWheel)
+      }
     }
   }, [handleWheel])
 
@@ -977,7 +1208,9 @@ function App() {
       simplifiedPointCount: mapData.simplifiedPointCount,
       startPoint: mapData.startPoint,
       endPoint: mapData.endPoint,
-      meshes: mapData.meshes
+      simplifiedLines: mapData.simplifiedLines,
+      meshes: mapData.meshes,
+      items: mapData.items
     }
 
     const jsonStr = JSON.stringify(exportData)
@@ -1062,6 +1295,7 @@ function App() {
           <p>RDP简化后点数: {mapData.simplifiedPointCount} (减少 {((1 - mapData.simplifiedPointCount / mapData.originalPointCount) * 100).toFixed(1)}%)</p>
           <p>起点: {mapData.startPoint ? `(${mapData.startPoint.x}, ${mapData.startPoint.y})` : '未找到'}</p>
           <p>终点: {mapData.endPoint ? `(${mapData.endPoint.x}, ${mapData.endPoint.y})` : '未找到'}</p>
+          <p>道具数量: {mapData.items ? mapData.items.length : 0}</p>
           <button className="download-button" onClick={handleDownloadJson}>
             下载 JSON 数据
           </button>
@@ -1086,6 +1320,25 @@ function App() {
           </button>
           <canvas
             ref={webglCanvasRef}
+            width={1024}
+            height={1024}
+            className="result-canvas"
+            style={{ cursor: isDragging ? 'grabbing' : 'grab' }}
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={handleMouseUp}
+            onMouseLeave={handleMouseLeave}
+          />
+        </div>
+      )}
+
+      {mapData && (
+        <div className="canvas-section">
+          <h3>物理碰撞多边形 (Red/Green 1px)</h3>
+          <p>多边形数量: {mapData.simplifiedLines.reduce((sum, sl) => sum + sl.polygons.length, 0)}</p>
+          <p>用于物理引擎的碰撞边界验证 | 同步缩放平移</p>
+          <canvas
+            ref={collisionCanvasRef}
             width={1024}
             height={1024}
             className="result-canvas"

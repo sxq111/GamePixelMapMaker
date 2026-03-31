@@ -7,6 +7,15 @@ export interface Point {
 }
 
 /**
+ * Item point coordinate and color
+ */
+export interface ItemPoint {
+  x: number
+  y: number
+  color: string
+}
+
+/**
  * Mesh data for a single line, compatible with Cocos MeshRenderer
  */
 export interface LineMesh {
@@ -16,6 +25,21 @@ export interface LineMesh {
   uvs: number[]
   /** Triangle indices for rendering */
   indices: number[]
+}
+
+/**
+ * Simplified line data
+ */
+export interface SimplifiedLine {
+  /** Points in the line */
+  points: Point[]
+  /** Whether the line is a closed loop */
+  closed: boolean
+  /** Polygons for collision: [points[], points[]...]. 
+   * For open lines, contains one polygon wrapping the line.
+   * For closed lines, contains two polygons (outer and inner boundaries).
+   */
+  polygons: Point[][]
 }
 
 /**
@@ -32,12 +56,16 @@ export interface MapData {
   lines: Point[][]
   /** Number of separate line segments */
   lineCount: number
+  /** Number of closed loops */
+  closedLineCount: number
   /** Lines after RDP (Douglas-Peucker) simplification */
-  simplifiedLines: Point[][]
+  simplifiedLines: SimplifiedLine[]
   /** Total point count before simplification */
   originalPointCount: number
   /** Total point count after simplification */
   simplifiedPointCount: number
   /** Mesh data for each simplified line (for WebGL/Cocos rendering) */
   meshes: LineMesh[]
+  /** Items found on the right half of the map */
+  items: ItemPoint[]
 }
