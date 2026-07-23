@@ -35,11 +35,15 @@ export interface SimplifiedLine {
   points: Point[]
   /** Whether the line is a closed loop */
   closed: boolean
-  /** Polygons for collision: [points[], points[]...]. 
-   * For open lines, contains one polygon wrapping the line.
-   * For closed lines, contains two polygons (outer and inner boundaries).
+  /** Polygons for collision: [points[], points[]...].
+   * Normally an open line has one ribbon and a closed line has a ribbon plus a filler.
+   * A repaired line can contain per-segment rectangles and round join polygons.
    */
   polygons: Point[][]
+  /** Indices in polygons that still self-intersect after repair/fallback */
+  selfIntersectingPolygonIndices: number[]
+  /** Whether this line was split into per-segment collision polygons */
+  usedSegmentFallback: boolean
 }
 
 /**

@@ -18,6 +18,19 @@ interface SimplifiedLine {
   points: Point[]
   closed: boolean
   polygons: Point[][]
+  selfIntersectingPolygonIndices: number[]
+  usedSegmentFallback: boolean
+}
+
+interface CollisionPolygonResult {
+  polygons: Point[][]
+  selfIntersectingPolygonIndices: number[]
+  usedSegmentFallback: boolean
+}
+
+interface BuiltCollisionPolygon {
+  points: Point[]
+  sourceIndices: number[]
 }
 
 interface MapData {
@@ -97,11 +110,171 @@ const perpendicularDistance = (point: Point, lineStart: Point, lineEnd: Point): 
   return numerator / denominator
 }
 
-// Generate collision polygons from points and thickness
-const generatePolygons = (points: Point[], thickness: number, closed: boolean): Point[][] => {
-  if (points.length < 2) return []
+const GEOMETRY_EPSILON = 1e-6
+const LOCAL_WIDTH_RATIO = 0.4
+const WIDTH_SHRINK_RATIO = 0.6
+const MAX_WIDTH_SHRINK_ATTEMPTS = 5
+const MITER_LIMIT = 1.5
 
-  const halfThickness = thickness / 2
+const pointDistance = (a: Point, b: Point): number => {
+  return Math.hypot(b.x - a.x, b.y - a.y)
+}
+
+const crossProduct = (a: Point, b: Point, c: Point): number => {
+  return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+}
+
+const isPointOnSegment = (point: Point, start: Point, end: Point): boolean => {
+  if (Math.abs(crossProduct(start, end, point)) > GEOMETRY_EPSILON) return false
+  return point.x >= Math.min(start.x, end.x) - GEOMETRY_EPSILON
+    && point.x <= Math.max(start.x, end.x) + GEOMETRY_EPSILON
+    && point.y >= Math.min(start.y, end.y) - GEOMETRY_EPSILON
+    && point.y <= Math.max(start.y, end.y) + GEOMETRY_EPSILON
+}
+
+const segmentsIntersect = (a: Point, b: Point, c: Point, d: Point): boolean => {
+  const abC = crossProduct(a, b, c)
+  const abD = crossProduct(a, b, d)
+  const cdA = crossProduct(c, d, a)
+  const cdB = crossProduct(c, d, b)
+
+  if (((abC > GEOMETRY_EPSILON && abD < -GEOMETRY_EPSILON)
+      || (abC < -GEOMETRY_EPSILON && abD > GEOMETRY_EPSILON))
+    && ((cdA > GEOMETRY_EPSILON && cdB < -GEOMETRY_EPSILON)
+      || (cdA < -GEOMETRY_EPSILON && cdB > GEOMETRY_EPSILON))) {
+    return true
+  }
+
+  return (Math.abs(abC) <= GEOMETRY_EPSILON && isPointOnSegment(c, a, b))
+    || (Math.abs(abD) <= GEOMETRY_EPSILON && isPointOnSegment(d, a, b))
+    || (Math.abs(cdA) <= GEOMETRY_EPSILON && isPointOnSegment(a, c, d))
+    || (Math.abs(cdB) <= GEOMETRY_EPSILON && isPointOnSegment(b, c, d))
+}
+
+const pointToSegmentDistance = (point: Point, start: Point, end: Point): number => {
+  const dx = end.x - start.x
+  const dy = end.y - start.y
+  const lengthSquared = dx * dx + dy * dy
+  if (lengthSquared <= GEOMETRY_EPSILON) return pointDistance(point, start)
+
+  const projection = ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared
+  const t = Math.max(0, Math.min(1, projection))
+  return pointDistance(point, { x: start.x + t * dx, y: start.y + t * dy })
+}
+
+const segmentDistance = (a: Point, b: Point, c: Point, d: Point): number => {
+  if (segmentsIntersect(a, b, c, d)) return 0
+  return Math.min(
+    pointToSegmentDistance(a, c, d),
+    pointToSegmentDistance(b, c, d),
+    pointToSegmentDistance(c, a, b),
+    pointToSegmentDistance(d, a, b)
+  )
+}
+
+const polygonHasSelfIntersection = (polygon: Point[]): boolean => {
+  const n = polygon.length
+  if (n < 4) return false
+
+  for (let i = 0; i < n; i++) {
+    const nextI = (i + 1) % n
+    for (let j = i + 1; j < n; j++) {
+      const nextJ = (j + 1) % n
+      const adjacent = i === j || nextI === j || nextJ === i
+      if (adjacent) continue
+      if (segmentsIntersect(polygon[i], polygon[nextI], polygon[j], polygon[nextJ])) {
+        return true
+      }
+    }
+  }
+
+  return false
+}
+
+const findIntersectingSourceIndices = (polygons: BuiltCollisionPolygon[]): Set<number> => {
+  const result = new Set<number>()
+
+  for (const polygon of polygons) {
+    const n = polygon.points.length
+    if (n < 4) continue
+
+    for (let i = 0; i < n; i++) {
+      const nextI = (i + 1) % n
+      for (let j = i + 1; j < n; j++) {
+        const nextJ = (j + 1) % n
+        const adjacent = i === j || nextI === j || nextJ === i
+        if (adjacent) continue
+        if (segmentsIntersect(
+          polygon.points[i],
+          polygon.points[nextI],
+          polygon.points[j],
+          polygon.points[nextJ]
+        )) {
+          result.add(polygon.sourceIndices[i])
+          result.add(polygon.sourceIndices[nextI])
+          result.add(polygon.sourceIndices[j])
+          result.add(polygon.sourceIndices[nextJ])
+        }
+      }
+    }
+  }
+
+  return result
+}
+
+const calculateAdaptiveHalfWidths = (
+  points: Point[],
+  baseHalfThickness: number,
+  closed: boolean
+): number[] => {
+  const n = points.length
+  const minimumHalfThickness = baseHalfThickness * 0.05
+  const widths = new Array<number>(n).fill(baseHalfThickness)
+
+  // Short neighboring segments cannot support a long perpendicular/miter offset.
+  for (let i = 0; i < n; i++) {
+    const hasPrev = closed || i > 0
+    const hasNext = closed || i < n - 1
+    if (hasPrev) {
+      const prevIdx = closed ? (i - 1 + n) % n : i - 1
+      widths[i] = Math.min(widths[i], pointDistance(points[prevIdx], points[i]) * LOCAL_WIDTH_RATIO)
+    }
+    if (hasNext) {
+      const nextIdx = closed ? (i + 1) % n : i + 1
+      widths[i] = Math.min(widths[i], pointDistance(points[i], points[nextIdx]) * LOCAL_WIDTH_RATIO)
+    }
+    widths[i] = Math.max(widths[i], minimumHalfThickness)
+  }
+
+  // If two non-adjacent center-line segments are close, taper both of them locally.
+  const segmentCount = closed ? n : n - 1
+  for (let i = 0; i < segmentCount; i++) {
+    const iEnd = (i + 1) % n
+    for (let j = i + 1; j < segmentCount; j++) {
+      const jEnd = (j + 1) % n
+      const sharesEndpoint = i === j || i === jEnd || iEnd === j || iEnd === jEnd
+      if (sharesEndpoint) continue
+
+      const clearance = segmentDistance(points[i], points[iEnd], points[j], points[jEnd])
+      if (clearance >= baseHalfThickness * 2) continue
+
+      const safeHalfThickness = Math.max(minimumHalfThickness, clearance * LOCAL_WIDTH_RATIO)
+      widths[i] = Math.min(widths[i], safeHalfThickness)
+      widths[iEnd] = Math.min(widths[iEnd], safeHalfThickness)
+      widths[j] = Math.min(widths[j], safeHalfThickness)
+      widths[jEnd] = Math.min(widths[jEnd], safeHalfThickness)
+    }
+  }
+
+  return widths
+}
+
+// Expand a line into a collision ribbon. Each source point can have its own width.
+const buildCollisionRibbon = (
+  points: Point[],
+  halfWidths: number[],
+  closed: boolean
+): BuiltCollisionPolygon[] => {
   const leftSide: Point[] = []
   const rightSide: Point[] = []
   const n = points.length
@@ -128,15 +301,26 @@ const generatePolygons = (points: Point[], thickness: number, closed: boolean): 
       const n1y = dx1 / len1
       const n2x = -dy2 / len2
       const n2y = dx2 / len2
-      perpX = (n1x + n2x) / 2
-      perpY = (n1y + n2y) / 2
-      const perpLen = Math.sqrt(perpX * perpX + perpY * perpY) || 1
-      perpX /= perpLen
-      perpY /= perpLen
-      const dot = n1x * perpX + n1y * perpY
-      if (Math.abs(dot) > 0.1) {
-        perpX /= dot
-        perpY /= dot
+      const bisectorX = n1x + n2x
+      const bisectorY = n1y + n2y
+      const bisectorLength = Math.hypot(bisectorX, bisectorY)
+      if (bisectorLength > GEOMETRY_EPSILON) {
+        const unitX = bisectorX / bisectorLength
+        const unitY = bisectorY / bisectorLength
+        const dot = n1x * unitX + n1y * unitY
+        if (Math.abs(dot) > GEOMETRY_EPSILON) {
+          const miterScale = Math.min(1 / Math.abs(dot), MITER_LIMIT)
+          const direction = Math.sign(dot)
+          perpX = unitX * direction * miterScale
+          perpY = unitY * direction * miterScale
+        } else {
+          perpX = n1x
+          perpY = n1y
+        }
+      } else {
+        // Near-180-degree reversal: avoid an unstable infinitely long miter.
+        perpX = n1x
+        perpY = n1y
       }
     } else if (hasNext) {
       const next = points[nextIdx]
@@ -163,8 +347,8 @@ const generatePolygons = (points: Point[], thickness: number, closed: boolean): 
     }
 
     if (!isNaN(perpX) && !isNaN(perpY)) {
-      leftSide.push({ x: curr.x + perpX * halfThickness, y: curr.y + perpY * halfThickness })
-      rightSide.push({ x: curr.x - perpX * halfThickness, y: curr.y - perpY * halfThickness })
+      leftSide.push({ x: curr.x + perpX * halfWidths[i], y: curr.y + perpY * halfWidths[i] })
+      rightSide.push({ x: curr.x - perpX * halfWidths[i], y: curr.y - perpY * halfWidths[i] })
     } else {
       leftSide.push({ ...curr })
       rightSide.push({ ...curr })
@@ -186,11 +370,120 @@ const generatePolygons = (points: Point[], thickness: number, closed: boolean): 
       { ...rightSide[n - 1] }
     ]
     
-    return [mainBody, filler]
+    return [
+      {
+        points: mainBody,
+        sourceIndices: [
+          ...points.map((_, index) => index),
+          ...points.map((_, index) => n - 1 - index)
+        ]
+      },
+      {
+        points: filler,
+        sourceIndices: [n - 1, 0, 0, n - 1]
+      }
+    ]
   } else {
     // For open lines, combine sides into one single wrapping polygon
-    return [[...leftSide, ...([...rightSide].reverse())]]
+    return [{
+      points: [...leftSide, ...([...rightSide].reverse())],
+      sourceIndices: [
+        ...points.map((_, index) => index),
+        ...points.map((_, index) => n - 1 - index)
+      ]
+    }]
   }
+}
+
+// Guaranteed-simple fallback: one rectangle per segment plus round join polygons.
+const buildSegmentFallback = (
+  points: Point[],
+  halfWidths: number[],
+  closed: boolean
+): BuiltCollisionPolygon[] => {
+  const polygons: BuiltCollisionPolygon[] = []
+  const n = points.length
+  const segmentCount = closed ? n : n - 1
+
+  for (let i = 0; i < segmentCount; i++) {
+    const nextIdx = (i + 1) % n
+    const start = points[i]
+    const end = points[nextIdx]
+    const dx = end.x - start.x
+    const dy = end.y - start.y
+    const length = Math.hypot(dx, dy)
+    if (length <= GEOMETRY_EPSILON) continue
+
+    const halfWidth = Math.min(halfWidths[i], halfWidths[nextIdx])
+    const normalX = -dy / length
+    const normalY = dx / length
+    polygons.push({
+      points: [
+        { x: start.x + normalX * halfWidth, y: start.y + normalY * halfWidth },
+        { x: end.x + normalX * halfWidth, y: end.y + normalY * halfWidth },
+        { x: end.x - normalX * halfWidth, y: end.y - normalY * halfWidth },
+        { x: start.x - normalX * halfWidth, y: start.y - normalY * halfWidth }
+      ],
+      sourceIndices: [i, nextIdx, nextIdx, i]
+    })
+  }
+
+  // Fill the gaps between rectangles at turns without introducing concave polygons.
+  const joinStart = closed ? 0 : 1
+  const joinEnd = closed ? n : n - 1
+  const joinSegments = 8
+  for (let i = joinStart; i < joinEnd; i++) {
+    const join: Point[] = []
+    for (let segment = 0; segment < joinSegments; segment++) {
+      const angle = segment / joinSegments * Math.PI * 2
+      join.push({
+        x: points[i].x + Math.cos(angle) * halfWidths[i],
+        y: points[i].y + Math.sin(angle) * halfWidths[i]
+      })
+    }
+    polygons.push({
+      points: join,
+      sourceIndices: new Array<number>(joinSegments).fill(i)
+    })
+  }
+
+  return polygons
+}
+
+// Generate collision polygons with adaptive width, self-intersection repair and fallback.
+const generatePolygons = (points: Point[], thickness: number, closed: boolean): CollisionPolygonResult => {
+  if (points.length < 2) {
+    return { polygons: [], selfIntersectingPolygonIndices: [], usedSegmentFallback: false }
+  }
+
+  const baseHalfThickness = thickness / 2
+  const minimumHalfThickness = baseHalfThickness * 0.05
+  const halfWidths = calculateAdaptiveHalfWidths(points, baseHalfThickness, closed)
+  let builtPolygons = buildCollisionRibbon(points, halfWidths, closed)
+
+  for (let attempt = 0; attempt < MAX_WIDTH_SHRINK_ATTEMPTS; attempt++) {
+    const intersectingSourceIndices = findIntersectingSourceIndices(builtPolygons)
+    if (intersectingSourceIndices.size === 0) {
+      return {
+        polygons: builtPolygons.map(polygon => polygon.points),
+        selfIntersectingPolygonIndices: [],
+        usedSegmentFallback: false
+      }
+    }
+
+    for (const index of intersectingSourceIndices) {
+      halfWidths[index] = Math.max(minimumHalfThickness, halfWidths[index] * WIDTH_SHRINK_RATIO)
+    }
+    builtPolygons = buildCollisionRibbon(points, halfWidths, closed)
+  }
+
+  builtPolygons = buildSegmentFallback(points, halfWidths, closed)
+  const polygons = builtPolygons.map(polygon => polygon.points)
+  const selfIntersectingPolygonIndices = polygons
+    .map((polygon, index) => polygonHasSelfIntersection(polygon) ? index : -1)
+    .filter(index => index >= 0)
+
+  return { polygons, selfIntersectingPolygonIndices, usedSegmentFallback: true }
 }
 
 // Simplify all lines using RDP algorithm
@@ -198,10 +491,13 @@ const simplifyLines = (lines: Point[][], epsilon: number): SimplifiedLine[] => {
   return lines.map(line => {
     const simplifiedPoints = rdpSimplify(line, epsilon)
     const closed = isLineClosed(line)
+    const collisionResult = generatePolygons(simplifiedPoints, 2, closed)
     return {
       points: simplifiedPoints,
       closed,
-      polygons: generatePolygons(simplifiedPoints, 2, closed) // 2px thickness to match mesh
+      polygons: collisionResult.polygons,
+      selfIntersectingPolygonIndices: collisionResult.selfIntersectingPolygonIndices,
+      usedSegmentFallback: collisionResult.usedSegmentFallback
     }
   })
 }
@@ -953,12 +1249,16 @@ function App() {
     ctx.scale(scale, scale)
     ctx.translate(-translation.x, -translation.y)
 
-    // Draw polygons using alternating red and green colors (1px)
+    // Draw normal polygons in alternating red/green, residual self-intersections in purple.
     let polyIdx = 0
-    ctx.lineWidth = 1 / scale // Keep line width constant regardless of zoom
     for (const sl of mapData.simplifiedLines) {
-      for (const poly of sl.polygons) {
-        ctx.strokeStyle = polyIdx % 2 === 0 ? '#ff0000' : '#00ff00'
+      for (let linePolyIdx = 0; linePolyIdx < sl.polygons.length; linePolyIdx++) {
+        const poly = sl.polygons[linePolyIdx]
+        const hasSelfIntersection = sl.selfIntersectingPolygonIndices.includes(linePolyIdx)
+        ctx.strokeStyle = hasSelfIntersection
+          ? '#a000ff'
+          : polyIdx % 2 === 0 ? '#ff0000' : '#00aa00'
+        ctx.lineWidth = (hasSelfIntersection ? 3 : 1) / scale
         if (poly.length > 0) {
           ctx.beginPath()
           ctx.moveTo(poly[0].x, poly[0].y)
@@ -1334,8 +1634,9 @@ function App() {
 
       {mapData && (
         <div className="canvas-section">
-          <h3>物理碰撞多边形 (Red/Green 1px)</h3>
+          <h3>物理碰撞多边形（红/绿：正常，紫色：残余自交）</h3>
           <p>多边形数量: {mapData.simplifiedLines.reduce((sum, sl) => sum + sl.polygons.length, 0)}</p>
+          <p>分段兜底折线: {mapData.simplifiedLines.filter(sl => sl.usedSegmentFallback).length} | 残余自交: {mapData.simplifiedLines.reduce((sum, sl) => sum + sl.selfIntersectingPolygonIndices.length, 0)}</p>
           <p>用于物理引擎的碰撞边界验证 | 同步缩放平移</p>
           <canvas
             ref={collisionCanvasRef}
